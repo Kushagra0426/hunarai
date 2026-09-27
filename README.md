@@ -1,72 +1,279 @@
 # Multi-Node Connection Management System
 
-Connection layer for a multi-tenant platform: thousands of concurrent
-long-lived WebSocket sessions, spread across several server nodes behind a load
-balancer, on behalf of multiple organizations. No managed connection services —
-the full lifecycle is owned here.
+Connection layer for a multi-tenant platform: thousands of concurrent long-lived
+WebSocket sessions, spread across several server nodes behind a load balancer, on
+behalf of multiple organizations. No managed connection services — the full
+lifecycle is owned here.
 
-## The shaping idea
+**Django Channels on uvicorn** holds the sockets · **Redis** owns live state and
+admission · **Postgres** holds org config and the session audit trail.
 
-Orphan cleanup, quota enforcement, fair sharing and distributed queries all fail
-the moment a node trusts its own local tally. So:
+Architecture and the reasoning behind every choice: **[DESIGN.md](DESIGN.md)**.
 
-> **Nodes host connections. A shared store owns the truth about them.**
+---
 
-Redis is that store — not for speed alone, but because Lua scripts run
-atomically. Two connections arriving in the same millisecond on different nodes
-get serialized inside one script: one admitted, one rejected. That is the
-admission race, solved. The rest of the design follows from it.
+## Setup
 
-## Layout
-
-| Layer | Holds | Why |
-| --- | --- | --- |
-| Django Channels on uvicorn | The sockets themselves | Consumer `connect`/`disconnect` maps onto the session lifecycle; uvicorn because the background loops need the ASGI lifespan |
-| Redis | Live session state, counts, node liveness | Atomic admission in one round-trip; authoritative for any quota decision |
-| Postgres | Org config, session audit trail | Durable and queryable — deliberately *not* the quota enforcer, since per-connect row locking contends exactly when load peaks |
-
-## Running the cluster
-
-Three nodes behind nginx, with Redis and Postgres. This is the way to see the
-system actually behave — requirements 2, 3 and 5 are multi-machine failures, and
-a single process cannot demonstrate them.
+Requires Docker and Python 3.12+. Nothing else — no local Redis or Postgres
+needed for the cluster.
 
 ```bash
-docker compose up --build -d
-open http://localhost:8090/               # live dashboard
-curl localhost:8090/api/capacity          # three live nodes
+git clone git@github.com:Kushagra0426/hunarai.git
+cd hunarai
 
-# requirement 3 — the per-org cap holds across nodes
-.venv/bin/python scripts/load.py --org initech --count 150
-
-# requirement 2 — kill a node, watch its sessions get reaped
-./scripts/chaos_kill.sh node2
-
-# requirement 5 — stop a node gracefully, watch clients move
-./scripts/chaos_drain.sh node2
+docker compose up --build -d          # 3 nodes + nginx + redis + postgres
 ```
 
-Three nodes rather than two: with two, a killed node's sessions can only land on
-the single obvious survivor, which shows less than seeing them spread.
+First build takes a few minutes. When it settles:
 
-### The dashboard
+```bash
+curl localhost:8090/api/capacity      # should list 3 live nodes
+open http://localhost:8090/           # the dashboard
+```
 
-`http://localhost:8090/` — live cluster state polled every second, plus a panel
-that opens load. The fastest way to see the system behave:
+Migrations and the demo orgs are seeded automatically by a one-shot `migrate`
+service, which the nodes wait on — so three of them cannot race each other
+applying the same migrations.
 
-1. Pick **initech** (limit 100), set **150** connections, press **Open**.
-   100 are established and spread across the three nodes; 50 are refused `4429`
-   and the usage bar goes red at the cap.
-2. In a terminal, `docker compose kill -s SIGKILL node2`. Within
-   `NODE_TIMEOUT_SEC` the node card turns red and reads `GONE`, its sessions drop
-   off the total, and the org's bar falls back below the cap — capacity returned.
-3. `docker compose up -d node2`, then `docker compose stop node2`. This time the
-   activity log fills with `session closed 4504 — node draining, reconnect
-   elsewhere`: the clients were *told* to move rather than discovering a dead
-   socket.
+### For the test suite and load scripts
 
-The difference between steps 2 and 3 is visible in the audit trail too —
-`node_lost` versus `drained`:
+These run on your machine, not in a container, so they need a local virtualenv.
+The tests also need a **local Redis** on `6379` (they use database 15 and never
+touch the cluster's).
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt
+
+.venv/bin/pytest                      # 75 tests
+```
+
+### Seeded organizations
+
+| Org | Limit | Reserved floor |
+| --- | --- | --- |
+| `acme` | 500 | 100 |
+| `globex` | 800 | 50 |
+| `initech` | 100 | 25 |
+
+Global platform cap is **1000**, deliberately less than the sum of org limits
+(1400) so the global ceiling is reachable and testable.
+
+Cluster timings are tightened for demos (`HEARTBEAT_SEC=2`, `NODE_TIMEOUT_SEC=8`)
+so a chaos run finishes in seconds rather than the minute a production timeout
+would take.
+
+### Ports
+
+| Port | What |
+| --- | --- |
+| `8090` | nginx load balancer — **use this for everything** |
+| `16379` | Redis, exposed so you can watch live state |
+
+Port 8090 rather than 8080 because 8080 is commonly taken. Change it in
+`docker-compose.yml` if it clashes.
+
+---
+
+## Testing every requirement
+
+Each section below is self-contained: what to do on the dashboard, what to check
+in Docker, and what you should see. Open `http://localhost:8090/` first and keep
+it visible.
+
+Reset between tests with **Close all** on the dashboard, or:
+
+```bash
+docker compose exec redis redis-cli flushdb
+```
+
+---
+
+### 1 — Connection lifecycle
+
+*Every session is tracked, and cleaned up whether the client leaves politely or not.*
+
+**Dashboard:** pick `acme`, set **5**, press **Open**. The counters go to 5 and
+the nodes show the spread. Press **Close all** — back to 0.
+
+**Docker — see the actual records:**
+
+```bash
+docker compose exec redis redis-cli get org:acme:count
+docker compose exec redis redis-cli smembers org:acme:sessions
+docker compose exec redis redis-cli hgetall session:<paste-a-session-id>
+```
+
+The session hash holds the org, the node holding it, the client id, and the start
+time.
+
+**The harder case — a client that vanishes without saying goodbye.** Open 5, then
+kill the browser tab outright rather than pressing Close all. The count still
+returns to 0: Channels fires `disconnect` on transport loss, not just on a clean
+close.
+
+**Expected:** count rises to 5, falls to 0 either way, and the org set empties.
+
+---
+
+### 2 — A server node goes down
+
+*Sessions on a dead node must not linger as if they were still active.*
+
+**Dashboard:** pick `acme`, set **60**, **Open**. The three node cards fill up —
+not evenly, since nginx uses `least_conn` rather than strict round-robin.
+
+**Docker — kill one outright, with no chance to clean up:**
+
+```bash
+docker compose kill -s SIGKILL node2
+```
+
+**Watch the dashboard.** Within about 10 seconds (`NODE_TIMEOUT_SEC=8` plus poll
+lag) the `node2` card turns red and reads **GONE**, the session total drops by
+node2's share, and the org's usage bar falls back.
+
+**Docker — confirm the state is genuinely correct, not just repainted:**
+
+```bash
+docker compose exec redis redis-cli get org:acme:count          # dropped by node2's share
+docker compose exec redis redis-cli scard node:node2:sessions   # 0
+docker compose exec redis redis-cli zrange nodes:alive 0 -1     # node2 absent
+
+docker compose exec postgres psql -U connmgr -d connmgr -c \
+  "select node_id, end_reason, count(*) from connsessions_sessionrecord
+   where node_id='node2' group by 1,2;"
+```
+
+**Expected:** sessions released, node gone from the liveness set, and its rows
+marked **`node_lost`** — the audit trail records that something noticed the
+silence, rather than the node reporting in. A real run of exactly this:
+
+```
+before:  acme=60   node2 holds 28
+after:   acme=32   node2 set=0   alive=[node3 node1]
+         node2 | node_lost | 28
+```
+
+Restore it: `docker compose up -d node2`
+
+---
+
+### 3 — Capacity limits
+
+*A per-org cap that holds even when connections arrive simultaneously on different nodes.*
+
+**Dashboard:** pick `initech` (limit **100**), set **150**, press **Open**.
+
+**Expected, in the activity log:**
+
+```
+established 100   →   node1: 26   node2: 46   node3: 28
+refused 50        code 4429  (org at its limit)
+```
+
+The usage bar goes red and full. **Established is always exactly 100; the spread
+across nodes varies run to run** — `least_conn` distributes by current load, not
+evenly. That is the interesting part: those 150 arrived at three different nodes
+simultaneously, in whatever proportion, and the cap still bound to the exact
+number.
+
+**Docker:**
+
+```bash
+docker compose exec redis redis-cli get org:initech:count       # exactly 100
+```
+
+**The same thing from the CLI, which reports more detail:**
+
+```bash
+.venv/bin/python scripts/load.py --org initech --count 150 --hold 10
+```
+
+Use `--hold` to keep sessions open. Without it each client closes immediately, so
+later clients legitimately reuse freed slots and the *cumulative* admitted count
+exceeds the limit without it ever being breached — the script reports peak
+concurrent for exactly this reason.
+
+**The unit test is the sharpest version of this proof:**
+
+```bash
+.venv/bin/pytest tests/test_admission.py -v -k concurrent
+```
+
+---
+
+### 4 — Fair resource sharing
+
+*One org must not be able to consume all available capacity.*
+
+This needs the platform genuinely saturated, so it takes two steps. The global cap
+is 1000.
+
+**Step 1 — fill the platform** using two terminals, or the dashboard twice:
+
+```bash
+.venv/bin/python scripts/load.py --org globex --count 800 --hold 60 &
+sleep 10
+.venv/bin/python scripts/load.py --org acme --count 200 --hold 45 &
+sleep 10
+docker compose exec redis redis-cli get global:count      # 1000 — saturated
+```
+
+**Step 2 — a quiet org asks for capacity on a full platform.** `initech` holds
+nothing and has a reserved floor of 25:
+
+```bash
+.venv/bin/python scripts/load.py --org initech --count 60 --hold 5
+```
+
+**Expected:**
+
+```
+established : 25
+refused 35        code 4503  (platform full)
+```
+
+**This is the whole point.** The platform had *zero* free capacity, yet initech
+still got exactly its guaranteed floor of 25. Without the floor it would have been
+locked out entirely by a noisy neighbour — despite paying, and despite being far
+below its own limit of 100. Above the floor it competes like everyone else, which
+is why the other 35 were refused.
+
+Measured output from a real run of exactly this:
+
+```
+platform: global=1000 of 1000  (SATURATED)
+  globex=800  acme=200  initech=0
+initech asks for 60:
+  established : 25        ← its floor, honoured
+  refused 35   code 4503  ← above the floor, competing and losing
+```
+
+---
+
+### 5 — Graceful draining
+
+*A node shutting down should wind down, not drop everything at once.*
+
+**Dashboard:** pick `acme`, set **60**, **Open**. Wait for all 60.
+
+**Docker — shut one down politely:**
+
+```bash
+docker compose stop node2
+```
+
+**Watch the dashboard activity log.** It fills with:
+
+```
+session closed 4504 — node draining, reconnect elsewhere
+```
+
+That is the contrast with test 2. There the node died and something else had to
+notice. Here the node *told* its clients to move before going away.
+
+**Docker — the audit trail records the difference:**
 
 ```bash
 docker compose exec postgres psql -U connmgr -d connmgr -c \
@@ -74,54 +281,73 @@ docker compose exec postgres psql -U connmgr -d connmgr -c \
    where end_reason in ('drained','node_lost') group by 1,2 order by 1,2;"
 ```
 
-The load buttons open **real WebSocket connections from the browser**, not
-server-side simulations — simulated load would prove nothing about the connection
-layer. Nothing on the page kills containers; that stays in your terminal, where
-it belongs.
+**Expected:** node2's sessions marked **`drained`**, not `node_lost` — the node
+cleaned up after itself rather than the reaper having to. The other 40 sessions on
+node1 and node3 are untouched.
 
-Django admin at `/admin` gives the full session history (needs
-`docker compose exec node1 python manage.py createsuperuser`).
+**Confirm new connections land elsewhere** while node2 is down — press **Open**
+again and the spread covers only node1 and node3.
 
-The chaos scripts need `websockets` locally (`pip install -r requirements-dev.txt`).
-Redis is published on `16379` so you can watch live state while they run.
+Restore: `docker compose up -d node2`
 
-## Running a single node
+**Pacing** is off by default (`DRAIN_BATCH_SIZE=0` closes everything at once). Set
+a batch size and `DRAIN_INTERVAL_MS` in `docker-compose.yml` to spread reconnects
+so a deploy does not stampede the surviving nodes.
 
-Requires Redis on `localhost:6379`. Postgres is optional — without
-`DATABASE_URL` it falls back to sqlite, which is enough for a smoke test.
+---
+
+### 6 — Distributed state
+
+*Any node, or an external service, must be able to answer questions about any session.*
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements-dev.txt
-cp .env.example .env
-
-.venv/bin/python manage.py migrate
-.venv/bin/python manage.py seed_orgs        # acme, globex, initech
-.venv/bin/uvicorn connmgr.asgi:application --lifespan on
-
-curl localhost:8000/health     # {"status": "ok", "node_id": "..."}
+curl localhost:8090/api/capacity | python3 -m json.tool
+curl localhost:8090/api/orgs/acme/sessions | python3 -m json.tool
+curl localhost:8090/api/sessions/<session-id> | python3 -m json.tool
 ```
 
-uvicorn rather than daphne, and `--lifespan on` is required: the heartbeat and
-reaper loops start from the ASGI lifespan, and **daphne does not implement the
-lifespan protocol at all**, so under daphne they silently never run and dead nodes
-are never reaped.
+Every response carries **`answered_by`** — the node that handled that request.
+Open some sessions first, then call the endpoint repeatedly: different nodes
+answer, and the numbers are identical every time. That is the requirement — the
+answer does not depend on which node you asked.
 
-The `node_id` in that response is how the chaos scripts later confirm the load
-balancer is genuinely spreading connections across nodes.
-
-### Connecting a session
+```bash
+.venv/bin/python scripts/load.py --org acme --count 30 --hold 20 &
+sleep 8
+for i in 1 2 3 4 5 6; do
+  curl -s localhost:8090/api/capacity | python3 -c \
+    "import sys,json; d=json.load(sys.stdin); print(d['answered_by'], '→', d['global']['sessions'])"
+done
+```
 
 ```
-ws://localhost:8000/ws/<org_slug>/?client_id=<opaque-id>
+node1 → 30      ← different nodes answering
+node3 → 30
+node1 → 30
+node3 → 30
 ```
 
-The server replies with `session.established` carrying the session id, the node
-that took the connection, and the org's current usage against its limit.
-`{"type": "ping"}` gets a `pong`, which is how the chaos scripts confirm a held
-connection is genuinely alive rather than merely unclosed.
+Do this on an idle cluster and you will likely see the *same* node every time.
+That is nginx `least_conn` working as intended, not a bug: with no connections to
+balance it keeps choosing the same upstream. The rotation appears once there is
+load to spread — and note it favours the least-loaded nodes, so a node carrying
+more WebSocket sessions gets fewer API requests.
 
-Rejections arrive as application close codes, split by whether retrying helps:
+`/api/orgs/<slug>/sessions` includes a `by_node` breakdown — that is what shows
+the balancer spreading an org across nodes, and what shows a node's sessions
+vanishing when it dies.
+
+**Django admin** at `/admin` gives the full searchable session history:
+
+```bash
+docker compose exec node1 python manage.py createsuperuser
+```
+
+---
+
+## Rejection codes
+
+The distinction matters: some mean *retrying is pointless*, others mean *try again*.
 
 | Code | Meaning | Retry? |
 | --- | --- | --- |
@@ -132,198 +358,96 @@ Rejections arrive as application close codes, split by whether retrying helps:
 | `4504` | Node draining or shutting down | Yes, immediately — another node will take it |
 | `4409` | Duplicate session id | No |
 
-Watch the live state while a client is connected:
+---
+
+## Connecting a client directly
+
+```
+ws://localhost:8090/ws/<org_slug>/?client_id=<opaque-id>
+```
+
+The server replies with `session.established` carrying the session id, the node
+that took the connection, and the org's usage against its limit. `{"type":
+"ping"}` returns a `pong`, which is how the scripts confirm a held connection is
+genuinely alive rather than merely unclosed.
+
+---
+
+## Tests
 
 ```bash
-redis-cli get org:acme:count
-redis-cli smembers org:acme:sessions
-redis-cli hgetall session:<session-id>
+.venv/bin/pytest                      # 75 tests, needs local Redis on 6379
+.venv/bin/pytest tests/test_admission.py -v   # the admission race
+.venv/bin/pytest tests/test_reaper.py -v      # node death, fake clock
+.venv/bin/pytest tests/test_drain.py -v       # graceful shutdown
 ```
 
-## Admission control
+Real Redis throughout, never a mock — what is under test is that Redis serialises
+a script, and a mock would only prove the mock behaves as imagined. Tests use
+database 15 and pin their own settings module, so they cannot reach the cluster's
+Redis or any configured Postgres.
 
-Every limit is checked and applied inside one Lua script
-(`connsessions/lua/admit.lua`). The reason is the race: two connections arriving
-in the same millisecond on different nodes would both read "499 of 500", both
-decide there is room, and both be admitted. Redis runs a script start to finish
-without interleaving another client, so they are serialised instead.
-
-Measured, not asserted — same logic, same concurrency, only atomicity differs:
-
-```
-50 simultaneous admissions against a limit of 10
-
-check-then-increment  admitted = 50   ← limit breached
-one atomic script     admitted = 10   ← holds
-```
-
-Three rules, in order:
-
-1. **Org ceiling** — `org_count >= max_sessions` → `ORG_LIMIT`. Binds however
-   empty the platform is; it is what the tenant pays for.
-2. **Fair sharing** — `global_count >= GLOBAL_MAX_SESSIONS` **and**
-   `org_count >= reserved_floor` → `GLOBAL_FULL`. Note the `and`: below its floor
-   an org is admitted even when the platform is full, which is what stops a noisy
-   tenant from locking out a paying one that is well under its own limit. Above
-   the floor everyone competes first-come.
-3. **Guards** — a duplicate session id and a draining node are both refused here
-   rather than in Python, so the check is atomic with the increment.
-
-Limits live on `Organization` rows in Postgres but are cached in
-`org:{slug}:cfg` and read from there on every connect; a `post_save` signal
-writes through, so an admin edit takes effect immediately.
-
-## Node death and orphan reaping
-
-When a node crashes nobody sends a goodbye. The sessions it held are gone but
-still counted, and an org whose quota is full of ghosts cannot connect. Fixing
-that is requirement 2.
-
-Each node writes a timestamp to `nodes:alive` every `HEARTBEAT_SEC`. A reaper on
-every node looks for entries older than `NODE_TIMEOUT_SEC` and releases those
-nodes' sessions via `reap_node.lua`.
-
-Measured, with `NODE_TIMEOUT_SEC=6`:
-
-```
-7 sessions across 2 nodes, SIGKILL one holding 4
-
-immediately after kill   org_count = 7    ghosts still counted
-4.5s later               org_count = 3    reaped
-surviving node           still serving, ping still answered
-```
-
-Three things worth knowing:
-
-- **The timeout is a tuning knob, not a correct answer.** A crashed node and a
-  briefly unreachable one are indistinguishable from outside. Too low and a
-  network blip reaps a healthy node's sessions; too high and dead nodes hold
-  quota. There is no value that is right, only one that is tuned.
-- **A node never reaps itself.** If its own heartbeat is stale it is still
-  demonstrably alive — it is running the reaper — so treating itself as dead would
-  drop working connections.
-- **The reaper runs everywhere, guarded by a lock.** No singleton service to lose;
-  whoever is up does the work. `reap_node.lua` is idempotent, so a lost race is
-  harmless, but the lock keeps duplicated work and alarming log lines down.
-
-`reap_node.lua` verifies each session hash rather than trusting the node's session
-set. On the ordinary path release already removes the id, so the check looks
-redundant — but the reaper reads `SMEMBERS` once and then works the list, so a
-release landing in between leaves it holding ids that are already accounted for.
-Counting those again drives the count below the truth, and a count that reads low
-is free capacity nobody paid for.
-
-## Graceful drain
-
-On SIGTERM a node sets its drain flag in Redis, then closes its live connections
-with **4504**, and the load balancer sends the retries to a healthy node.
-
-Order matters and is the whole correctness argument: the flag goes in *first*, so
-`admit.lua` is already refusing new sessions for this node before any socket is
-closed. The other order leaves a window where a connection lands on a node that
-is shutting down.
-
-Measured — SIGTERM a node holding 6 of 6 sessions:
-
-```
-all closed in 0.66s with code 4504
-org_count       6 -> 0
-nodes:alive     drain-n1 removed
-6 reconnects    all landed on drain-n2
-audit trail     6 rows marked "drained", not "client"
-```
-
-**Sessions are not migrated.** The connection genuinely breaks and the client
-genuinely reconnects. Moving a live session would mean serialising its state and
-handing it to another node — a substantially harder problem, and out of scope
-here. Better said plainly than implied away.
-
-Drain is installed as a SIGTERM handler rather than run from lifespan shutdown,
-which is too late: uvicorn handles SIGTERM by closing live websockets with `1012`
-(Service Restart) and only *then* fires the shutdown event, so a drain there
-finds nothing left to close and clients cannot tell a planned drain from a crash.
-
-Pacing is off by default — `DRAIN_BATCH_SIZE=0` closes everything at once. Set a
-batch size and `DRAIN_INTERVAL_MS` to spread the reconnects; the surviving nodes
-are already absorbing this node's load, so handing them every reconnect in the
-same instant is the worst moment to do it.
-
-## Query API
-
-Requirement 6: any node answers, because the answers come from Redis rather than
-from the node's own view of its connections.
+The scripted equivalents of tests 2 and 5, if you prefer one command:
 
 ```bash
-curl localhost:8000/api/capacity
-curl localhost:8000/api/orgs/acme/sessions
-curl localhost:8000/api/sessions/<session-id>
+./scripts/chaos_kill.sh node2         # SIGKILL and watch the reap
+./scripts/chaos_drain.sh node2        # SIGTERM and watch the drain
 ```
 
-Every response carries `answered_by`, so you can see that a session on `node-1`
-is reported identically by `node-2`. `/api/orgs/<slug>/sessions` includes a
-`by_node` breakdown — that is what shows the balancer spreading an org across
-nodes, and what shows a node's sessions vanishing when it dies.
+---
 
-The views are **async**. They share the process's Redis client with the
-consumers, so a sync view bridging via `asyncio.run()` creates a second event
-loop inside the running server and fails with "Future attached to a different
-loop" the moment it touches that client.
+## Repairing the audit trail
 
-`/health` returns **503 while draining**, so the load balancer stops sending new
-connections to a node that is on its way out.
-
-### Repairing the audit trail
-
-A node that dies while not in `nodes:alive` at all — killed before its first
+A node that dies while not yet in `nodes:alive` — killed before its first
 heartbeat, or during a Redis outage — is never discovered, so its audit rows stay
 open while the live count stays correct.
 
 ```bash
-.venv/bin/python manage.py reconcile --dry-run
-.venv/bin/python manage.py reconcile
+docker compose exec node1 python manage.py reconcile --dry-run
+docker compose exec node1 python manage.py reconcile
 ```
 
 Redis is the authority on what is live, so a row with no session in Redis is
-finished by definition. Only the audit trail is repaired; live counts are never
-touched, because guessing at them is the bug this system exists to avoid. Not on a
-timer either — a scheduled job that quietly fixes drift hides whatever causes it.
+finished by definition. This repairs **only** the audit trail and never touches
+live counts — guessing at those is the bug this system exists to avoid. It is not
+on a timer either: a scheduled job that quietly fixes drift hides whatever causes
+it.
 
-### Tests
-
-```bash
-.venv/bin/pytest          # needs a local Redis; uses db 15, ignores DATABASE_URL
-```
-
-The one worth reading is `test_concurrent_admissions_never_exceed_the_limit` in
-`tests/test_admission.py`. Real Redis throughout, never a mock: what is under
-test is that Redis serialises a script, and a mock would only prove the mock
-behaves the way I imagined.
+---
 
 ## Configuration
 
-All environment-driven so one image runs as any node — see `.env.example` for
-the annotated list. The two worth understanding:
+Everything is environment-driven so one image runs as any node. See
+`.env.example` for the annotated list; the two worth understanding:
 
-- **`NODE_TIMEOUT_SEC`** — how long a node must stay silent before its sessions
-  are reaped. A crashed node and a briefly unreachable one are indistinguishable
-  from outside, so this is a tuning knob, not a correct answer.
+- **`NODE_TIMEOUT_SEC`** — how long a node must be silent before its sessions are
+  reaped. A crashed node and a briefly unreachable one are indistinguishable from
+  outside, so this is a tuning knob, not a correct answer.
 - **`GLOBAL_MAX_SESSIONS`** — the platform-wide ceiling. Per-org limits and
   reserved floors live on `Organization` rows instead, since they differ per
-  tenant.
+  tenant, and are editable in Django admin with immediate effect.
 
-Full architecture, the reasoning behind each choice, and a frank list of known
-weaknesses: **[DESIGN.md](DESIGN.md)**.
+---
 
-## Build phases
+## Shutting down
 
-- [x] **0 — Scaffold.** Project layout, env config, health endpoint, ASGI wiring.
-- [x] **1 — Session lifecycle.** Models, consumer, Redis register/release.
-- [x] **2 — Atomic admission.** `admit.lua`, per-org caps, reserved floor, race test.
-- [x] **3 — Liveness and reaping.** Heartbeats, orphan cleanup on node death.
-- [x] **4 — Drain and query API.** SIGTERM wind-down, capacity endpoints.
-- [x] **5 — Multi-node deployment.** Compose, nginx, chaos scripts, `DESIGN.md`.
+```bash
+docker compose down            # stop everything
+docker compose down -v         # also drop the Postgres volume
+```
 
-A note on the app name: the app is `connsessions`, not `sessions`, because
-`django.contrib.sessions` already claims that label and Django refuses to start
-with two apps sharing one. This app is the connection registry, not cookie
-sessions.
+---
+
+## Layout
+
+```
+connsessions/lua/            the correctness core — admission, release, reaping
+connsessions/registry.py     Redis client and key layout
+connsessions/consumers.py    WebSocket lifecycle
+connsessions/tasks.py        heartbeat and reaper loops
+connsessions/drain.py        graceful shutdown
+connsessions/views.py        query API and dashboard
+tests/                       75 tests against real Redis
+scripts/                     load generation and chaos
+DESIGN.md                    architecture and decisions
+```
