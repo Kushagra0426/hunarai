@@ -1,0 +1,10 @@
+# Pinned: this runs as several identical nodes, so drift between them would be
+# its own class of bug.
+
+django==6.1.1
+channels==4.3.2
+channels-redis==4.3.0
+daphne==4.2.3
+redis==8.1.0
+psycopg[binary]==3.3.6
+python-dotenv==1.2.3
