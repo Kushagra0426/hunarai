@@ -6,8 +6,11 @@ exactly when load peaks. Postgres answers "what happened" and "what is this org
 allowed"; Redis answers "what is true right now".
 """
 
+from asgiref.sync import async_to_sync
 from django.core.validators import MinValueValidator
 from django.db import models
+from django.db.models.signals import post_delete, post_save
+from django.dispatch import receiver
 
 
 class Organization(models.Model):
@@ -126,3 +129,38 @@ class SessionRecord(models.Model):
     @property
     def is_live(self):
         return self.ended_at is None
+
+
+# --- limit cache write-through -----------------------------------------------
+# Admission reads limits from Redis on every connect, so a limit edited in admin
+# has to reach Redis or it would not take effect until the cache happened to be
+# repopulated. Failures are logged, not raised: the consumer falls back to reading
+# Postgres directly, so a Redis blip must not make the org unsaveable.
+
+
+@receiver(post_save, sender=Organization)
+def _cache_org_limits(sender, instance, **kwargs):
+    from . import registry
+
+    try:
+        async_to_sync(registry.cache_org_config)(
+            instance.slug, instance.max_sessions, instance.reserved_floor
+        )
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "could not cache limits for org=%s; consumer will read from db",
+            instance.slug,
+            exc_info=True,
+        )
+
+
+@receiver(post_delete, sender=Organization)
+def _drop_org_limits(sender, instance, **kwargs):
+    from . import registry
+
+    try:
+        async_to_sync(registry.invalidate_org_config)(instance.slug)
+    except Exception:
+        pass

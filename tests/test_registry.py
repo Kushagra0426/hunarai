@@ -1,4 +1,7 @@
-"""Registry checks against a real Redis.
+"""Session release and query checks against a real Redis.
+
+Admission limits are covered in test_admission.py; here the limits are set high
+so release behaviour is what is actually under test.
 
 Real Redis, not a fake: the properties under test here (pipeline atomicity, that
 exactly one concurrent DEL wins) are properties of Redis itself, and a mock would
@@ -30,8 +33,18 @@ async def clean_keys():
 
 
 async def _register(org="pytest-org", node="pytest-node", sid=None):
+    """Admit with limits high enough not to interfere; this file tests release."""
     sid = sid or uuid.uuid4()
-    await registry.register_session(sid, org, node, "client-1", "2026-01-01T00:00:00Z")
+    await registry.admit_session(
+        session_id=sid,
+        org_slug=org,
+        node_id=node,
+        client_id="client-1",
+        started_at="2026-01-01T00:00:00Z",
+        max_sessions=10_000,
+        reserved_floor=0,
+        global_max=100_000,
+    )
     return sid
 
 

@@ -5,10 +5,10 @@ including on abnormal closes -- a killed client, a dropped network. That makes
 disconnect() the right place to release the slot, and it is why release must be
 tolerant of being called for a session that was never fully registered.
 
-What this phase does NOT do is enforce limits. A connection is admitted if the
-org exists and is active. Per-org caps, the reserved floor and the global
-ceiling arrive in phase 2, where the check and the increment happen inside one
-Lua script so they cannot interleave across nodes.
+Limits are enforced by a single Lua script (registry.admit_session), not here.
+That matters: the check and the increment have to be one indivisible step, or two
+connections arriving simultaneously on different nodes would both read "499 of
+500" and both be admitted.
 """
 
 import logging
@@ -30,6 +30,22 @@ log = logging.getLogger(__name__)
 CLOSE_UNKNOWN_ORG = 4404
 CLOSE_ORG_INACTIVE = 4403
 CLOSE_INTERNAL = 4500
+
+# Rejection reasons from admit.lua, mapped to codes a client can act on. The
+# distinction is deliberate: ORG_LIMIT means "you are at your own ceiling, buy
+# more" and retrying elsewhere is pointless, while GLOBAL_FULL and NODE_DRAINING
+# are transient and a retry is the right response.
+CLOSE_ORG_LIMIT = 4429
+CLOSE_GLOBAL_FULL = 4503
+CLOSE_NODE_DRAINING = 4504
+CLOSE_DUPLICATE = 4409
+
+REJECT_CODES = {
+    "ORG_LIMIT": CLOSE_ORG_LIMIT,
+    "GLOBAL_FULL": CLOSE_GLOBAL_FULL,
+    "NODE_DRAINING": CLOSE_NODE_DRAINING,
+    "DUPLICATE_SESSION": CLOSE_DUPLICATE,
+}
 
 
 class SessionConsumer(AsyncJsonWebsocketConsumer):
@@ -69,16 +85,40 @@ class SessionConsumer(AsyncJsonWebsocketConsumer):
         self.org_id = org.id
         started_at = timezone.now()
 
+        # Limits come from the Redis cache, not the row just loaded. The cache is
+        # the fast path (admission reads it on every connect) and the signal in
+        # models.py writes through on save, so it is as current as the row. On a
+        # cold miss fall back to the row and populate the cache.
+        limits = await registry.get_org_config(self.org_slug)
+        if limits is None:
+            limits = {
+                "max_sessions": org.max_sessions,
+                "reserved_floor": org.reserved_floor,
+            }
+            await registry.cache_org_config(
+                self.org_slug, org.max_sessions, org.reserved_floor
+            )
+
         try:
-            await registry.register_session(
+            org_count, global_count = await registry.admit_session(
                 session_id=self.session_id,
                 org_slug=self.org_slug,
                 node_id=self.node_id,
                 client_id=self.client_id,
                 started_at=started_at.isoformat(),
+                max_sessions=limits["max_sessions"],
+                reserved_floor=limits["reserved_floor"],
             )
             self.registered = True
+        except registry.Rejected as exc:
+            # Over a limit. Record the refusal so capacity pressure is visible
+            # after the fact, then close with a code the client can act on.
+            await self._write_rejection(started_at, org.id)
+            await self.accept()
+            await self.close(code=REJECT_CODES.get(exc.reason, CLOSE_INTERNAL))
+            return
 
+        try:
             await self._write_record(started_at)
         except Exception:
             # Registered in Redis but the audit write failed, or Redis itself is
@@ -100,6 +140,8 @@ class SessionConsumer(AsyncJsonWebsocketConsumer):
                 "session_id": str(self.session_id),
                 "org": self.org_slug,
                 "node_id": self.node_id,
+                "org_sessions": org_count,
+                "org_limit": limits["max_sessions"],
             }
         )
 
@@ -149,6 +191,19 @@ class SessionConsumer(AsyncJsonWebsocketConsumer):
             node_id=self.node_id,
             client_id=self.client_id,
             started_at=started_at,
+        )
+
+    @database_sync_to_async
+    def _write_rejection(self, started_at, org_id):
+        """Log the refusal. Born already ended -- it never held a slot."""
+        SessionRecord.objects.create(
+            session_id=self.session_id,
+            organization_id=org_id,
+            node_id=self.node_id,
+            client_id=self.client_id,
+            started_at=started_at,
+            ended_at=started_at,
+            end_reason=SessionRecord.EndReason.REJECTED,
         )
 
     @database_sync_to_async
