@@ -66,6 +66,23 @@ async def orgs(db):
     ]
 
 
+# --- dashboard -----------------------------------------------------------------
+
+
+async def test_dashboard_renders(async_client):
+    """Cheap guard against a missing template or a broken route.
+
+    Worth having because a stale container image once served 404 on two of three
+    nodes while the third worked, which is confusing to diagnose by hand.
+    """
+    response = await async_client.get("/")
+
+    assert response.status_code == 200
+    body = response.content.decode()
+    assert "Connection Manager" in body
+    assert "/api/capacity" in body   # the page must actually poll the API
+
+
 # --- health ------------------------------------------------------------------
 
 

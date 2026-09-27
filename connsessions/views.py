@@ -11,6 +11,7 @@ serialisation framework, a router and a viewset hierarchy.
 
 from django.conf import settings
 from django.http import Http404, JsonResponse
+from django.shortcuts import render
 
 from . import drain, registry
 from .models import Organization
@@ -20,6 +21,16 @@ from .models import Organization
 # asyncio.run() -- which creates a second loop inside the running server and
 # fails with "Future attached to a different loop" the moment it touches that
 # shared client. Async views run on the server's own loop and just await.
+
+
+async def dashboard(request):
+    """Live cluster view. Static page; everything on it comes from /api/capacity.
+
+    The load buttons open real WebSocket connections from the browser rather than
+    asking the server to simulate them -- simulated load would prove nothing about
+    the connection layer, which is the only thing worth showing here.
+    """
+    return render(request, "connsessions/dashboard.html")
 
 
 async def health(request):

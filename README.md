@@ -33,6 +33,7 @@ a single process cannot demonstrate them.
 
 ```bash
 docker compose up --build -d
+open http://localhost:8090/               # live dashboard
 curl localhost:8090/api/capacity          # three live nodes
 
 # requirement 3 — the per-org cap holds across nodes
@@ -47,6 +48,39 @@ curl localhost:8090/api/capacity          # three live nodes
 
 Three nodes rather than two: with two, a killed node's sessions can only land on
 the single obvious survivor, which shows less than seeing them spread.
+
+### The dashboard
+
+`http://localhost:8090/` — live cluster state polled every second, plus a panel
+that opens load. The fastest way to see the system behave:
+
+1. Pick **initech** (limit 100), set **150** connections, press **Open**.
+   100 are established and spread across the three nodes; 50 are refused `4429`
+   and the usage bar goes red at the cap.
+2. In a terminal, `docker compose kill -s SIGKILL node2`. Within
+   `NODE_TIMEOUT_SEC` the node card turns red and reads `GONE`, its sessions drop
+   off the total, and the org's bar falls back below the cap — capacity returned.
+3. `docker compose up -d node2`, then `docker compose stop node2`. This time the
+   activity log fills with `session closed 4504 — node draining, reconnect
+   elsewhere`: the clients were *told* to move rather than discovering a dead
+   socket.
+
+The difference between steps 2 and 3 is visible in the audit trail too —
+`node_lost` versus `drained`:
+
+```bash
+docker compose exec postgres psql -U connmgr -d connmgr -c \
+  "select node_id, end_reason, count(*) from connsessions_sessionrecord
+   where end_reason in ('drained','node_lost') group by 1,2 order by 1,2;"
+```
+
+The load buttons open **real WebSocket connections from the browser**, not
+server-side simulations — simulated load would prove nothing about the connection
+layer. Nothing on the page kills containers; that stays in your terminal, where
+it belongs.
+
+Django admin at `/admin` gives the full session history (needs
+`docker compose exec node1 python manage.py createsuperuser`).
 
 The chaos scripts need `websockets` locally (`pip install -r requirements-dev.txt`).
 Redis is published on `16379` so you can watch live state while they run.

@@ -4,6 +4,7 @@ from django.urls import path
 from connsessions import views
 
 urlpatterns = [
+    path("", views.dashboard, name="dashboard"),
     path("admin/", admin.site.urls),
     path("health", views.health, name="health"),
     # Requirement 6: any node answers these, because the answers come from Redis

@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connection Manager — live cluster</title>
+<style>
+  :root {
+    --ground: #fbfaf8;
+    --raised: #ffffff;
+    --ink: #16191c;
+    --soft: #5c6369;
+    --rule: #e4e2dc;
+    --accent: #1f6f5c;
+    --accent-bg: #e9f1ee;
+    --warn: #a8641f;
+    --warn-bg: #f9f0e6;
+    --dead: #a8391f;
+    --dead-bg: #f9e9e6;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #101315; --raised: #171b1e; --ink: #ededea; --soft: #99a0a5;
+      --rule: #2a3034; --accent: #4fa88f; --accent-bg: #16302a;
+      --warn: #d9a062; --warn-bg: #2c2419; --dead: #d97a62; --dead-bg: #2c1d19;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--ground); color: var(--ink);
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+
+  header { border-bottom: 2px solid var(--ink); padding-bottom: 1rem; margin-bottom: 1.75rem; }
+  h1 { margin: 0 0 .25rem; font-size: 1.5rem; letter-spacing: -.01em; }
+  .sub { color: var(--soft); font-size: .9rem; }
+  .live { display: inline-flex; align-items: center; gap: .4rem; font-family: var(--mono); font-size: .75rem; color: var(--accent); }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .25 } }
+  .dot.on { animation: pulse 1.6s ease-in-out infinite; }
+  .dot.off { background: var(--dead); animation: none; }
+
+  h2 { font-size: .72rem; text-transform: uppercase; letter-spacing: .1em;
+       color: var(--soft); margin: 2rem 0 .75rem; font-weight: 600; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(215px, 1fr)); gap: .85rem; }
+
+  .card { background: var(--raised); border: 1px solid var(--rule); border-radius: 5px;
+          padding: .9rem 1rem; transition: border-color .2s; }
+  .card.draining { border-color: var(--warn); background: var(--warn-bg); }
+  .card.gone { border-color: var(--dead); background: var(--dead-bg); opacity: .75; }
+
+  .card-top { display: flex; justify-content: space-between; align-items: baseline; gap: .5rem; }
+  .node-id { font-family: var(--mono); font-weight: 600; font-size: .95rem; }
+  .badge { font-size: .62rem; text-transform: uppercase; letter-spacing: .08em;
+           padding: .12rem .4rem; border-radius: 3px; font-weight: 700; }
+  .badge.ok { color: var(--accent); background: var(--accent-bg); }
+  .badge.draining { color: var(--warn); background: var(--warn-bg); }
+  .badge.gone { color: var(--dead); background: var(--dead-bg); }
+
+  .big { font-size: 2rem; font-weight: 300; font-variant-numeric: tabular-nums;
+         line-height: 1.1; margin: .35rem 0 .1rem; }
+  .unit { font-size: .78rem; color: var(--soft); }
+
+  table { width: 100%; border-collapse: collapse; font-size: .88rem; }
+  th { text-align: left; font-size: .66rem; text-transform: uppercase; letter-spacing: .08em;
+       color: var(--soft); padding: .5rem .65rem; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+  td { padding: .55rem .65rem; border-bottom: 1px solid var(--rule); font-variant-numeric: tabular-nums; }
+  tr:last-child td { border-bottom: none; }
+  .scroll { overflow-x: auto; background: var(--raised); border: 1px solid var(--rule); border-radius: 5px; }
+
+  .bar { position: relative; height: 7px; background: var(--rule); border-radius: 4px; overflow: hidden; min-width: 110px; }
+  .bar span { position: absolute; inset: 0 auto 0 0; background: var(--accent); transition: width .4s ease; }
+  .bar span.hot { background: var(--warn); }
+  .bar span.full { background: var(--dead); }
+  .floor { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--ink); opacity: .45; }
+
+  .panel { background: var(--raised); border: 1px solid var(--rule); border-radius: 5px;
+           padding: 1.1rem 1.25rem; display: flex; flex-direction: column; gap: .9rem; }
+  .row { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; }
+  label { font-size: .8rem; color: var(--soft); }
+  select, input {
+    font: inherit; font-size: .88rem; padding: .35rem .5rem; border-radius: 4px;
+    border: 1px solid var(--rule); background: var(--ground); color: var(--ink);
+  }
+  input[type=number] { width: 5.5rem; }
+  button {
+    font: inherit; font-size: .85rem; font-weight: 500; padding: .45rem .9rem;
+    border-radius: 4px; border: 1px solid var(--accent); background: var(--accent);
+    color: #fff; cursor: pointer; transition: opacity .15s;
+  }
+  button:hover { opacity: .88; }
+  button.ghost { background: transparent; color: var(--accent); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+
+  .log { font-family: var(--mono); font-size: .76rem; line-height: 1.7; max-height: 190px;
+         overflow-y: auto; background: var(--ground); border: 1px solid var(--rule);
+         border-radius: 4px; padding: .6rem .75rem; }
+  .log div { white-space: pre-wrap; }
+  .log .ok { color: var(--accent); }
+  .log .rej { color: var(--warn); }
+  .log .err { color: var(--dead); }
+  .log .dim { color: var(--soft); }
+
+  .note { font-size: .8rem; color: var(--soft); }
+  code { font-family: var(--mono); font-size: .85em; background: var(--rule); padding: .08em .3em; border-radius: 3px; }
+  .empty { color: var(--soft); font-size: .88rem; padding: .9rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>Connection Manager</h1>
+    <div class="sub">
+      Live cluster state, polled from <code>/api/capacity</code> —
+      <span class="live"><span class="dot on" id="dot"></span><span id="pollnote">connecting…</span></span>
+    </div>
+  </header>
+
+  <h2>Platform</h2>
+  <div class="grid">
+    <div class="card">
+      <div class="card-top"><span class="node-id">Sessions</span></div>
+      <div class="big" id="g-sessions">—</div>
+      <div class="unit">of <span id="g-limit">—</span> global capacity</div>
+    </div>
+    <div class="card">
+      <div class="card-top"><span class="node-id">Live nodes</span></div>
+      <div class="big" id="g-nodes">—</div>
+      <div class="unit" id="g-answered">&nbsp;</div>
+    </div>
+    <div class="card">
+      <div class="card-top"><span class="node-id">My connections</span></div>
+      <div class="big" id="g-mine">0</div>
+      <div class="unit">open from this browser</div>
+    </div>
+  </div>
+
+  <h2>Nodes</h2>
+  <div class="grid" id="nodes"><div class="empty">waiting for first poll…</div></div>
+
+  <h2>Organizations</h2>
+  <div class="scroll">
+    <table>
+      <thead>
+        <tr><th>Org</th><th>Sessions</th><th>Limit</th><th>Floor</th><th style="width:40%">Usage</th></tr>
+      </thead>
+      <tbody id="orgs"><tr><td colspan="5" class="empty">waiting…</td></tr></tbody>
+    </table>
+  </div>
+
+  <h2>Generate load</h2>
+  <div class="panel">
+    <div class="row">
+      <label for="org">org</label>
+      <select id="org"></select>
+      <label for="count">connections</label>
+      <input type="number" id="count" value="25" min="1" max="500">
+      <button id="open">Open</button>
+      <button id="closeall" class="ghost">Close all</button>
+    </div>
+    <p class="note">
+      These are real WebSocket connections opened from this browser, not simulated
+      server-side — so the counts above are the genuine article. Open more than an
+      org's limit and you will see the surplus refused with <code>4429</code>.
+      Closing this tab closes them all.
+    </p>
+    <div class="log" id="log"><div class="dim">no activity yet</div></div>
+  </div>
+
+  <h2>Try breaking it</h2>
+  <div class="panel">
+    <p class="note" style="margin:0">
+      Run these in a terminal while watching this page. Nothing here triggers them —
+      killing containers from a web page would be a genuinely bad idea to build.
+    </p>
+    <div class="log"><div><span class="dim"># node dies with no chance to clean up — watch its sessions get reaped</span>
+docker compose kill -s SIGKILL node2
+
+<span class="dim"># node shuts down gracefully — watch it drain and clients reconnect elsewhere</span>
+docker compose stop node2
+
+<span class="dim"># bring it back</span>
+docker compose up -d node2</div></div>
+  </div>
+
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var POLL_MS = 1000;
+  var sockets = [];
+  var orgLimits = {};
+  var seenNodes = {};     // node_id -> last state, so a node that vanishes still shows
+  var logEl = document.getElementById("log");
+  var logEmpty = true;
+
+  function log(msg, cls) {
+    if (logEmpty) { logEl.innerHTML = ""; logEmpty = false; }
+    var line = document.createElement("div");
+    if (cls) line.className = cls;
+    var t = new Date().toTimeString().slice(0, 8);
+    line.textContent = t + "  " + msg;
+    logEl.insertBefore(line, logEl.firstChild);
+    while (logEl.childNodes.length > 120) logEl.removeChild(logEl.lastChild);
+  }
+
+  function pct(used, limit) {
+    if (!limit) return 0;
+    return Math.min(100, Math.round((used / limit) * 1000) / 10);
+  }
+
+  function barClass(p) { return p >= 100 ? "full" : p >= 80 ? "hot" : ""; }
+
+  // --- polling ---------------------------------------------------------------
+
+  function render(d) {
+    document.getElementById("g-sessions").textContent = d.global.sessions;
+    document.getElementById("g-limit").textContent = d.global.limit;
+    document.getElementById("g-nodes").textContent = d.nodes.length;
+    document.getElementById("g-answered").textContent = "answered by " + d.answered_by;
+
+    // Nodes. A node that disappears between polls is kept and marked gone, because
+    // watching it drop out is the whole point of the chaos scripts.
+    var live = {};
+    d.nodes.forEach(function (n) { live[n.node_id] = n; seenNodes[n.node_id] = n; });
+
+    var ids = Object.keys(seenNodes).sort();
+    var html = ids.map(function (id) {
+      var n = live[id];
+      var gone = !n;
+      var cls = gone ? "gone" : (n.draining ? "draining" : "");
+      var badge = gone ? '<span class="badge gone">gone</span>'
+                : n.draining ? '<span class="badge draining">draining</span>'
+                : '<span class="badge ok">up</span>';
+      var count = gone ? "—" : n.sessions;
+      return '<div class="card ' + cls + '">'
+           +   '<div class="card-top"><span class="node-id">' + id + '</span>' + badge + '</div>'
+           +   '<div class="big">' + count + '</div>'
+           +   '<div class="unit">sessions</div>'
+           + '</div>';
+    }).join("");
+    document.getElementById("nodes").innerHTML = html || '<div class="empty">no nodes reporting</div>';
+
+    // Orgs
+    var rows = d.orgs.map(function (o) {
+      orgLimits[o.org] = o.limit;
+      var p = pct(o.sessions, o.limit);
+      var floorPct = pct(o.reserved_floor, o.limit);
+      return "<tr>"
+           + "<td><strong>" + o.org + "</strong></td>"
+           + "<td>" + o.sessions + "</td>"
+           + "<td>" + o.limit + "</td>"
+           + "<td>" + o.reserved_floor + "</td>"
+           + '<td><div class="bar"><span class="' + barClass(p) + '" style="width:' + p + '%"></span>'
+           +   '<i class="floor" style="left:' + floorPct + '%"></i></div></td>'
+           + "</tr>";
+    }).join("");
+    document.getElementById("orgs").innerHTML = rows || '<tr><td colspan="5" class="empty">no orgs</td></tr>';
+
+    // Keep the org picker in sync without clobbering the user's choice.
+    var sel = document.getElementById("org");
+    if (sel.options.length !== d.orgs.length) {
+      var chosen = sel.value;
+      sel.innerHTML = d.orgs.map(function (o) {
+        return '<option value="' + o.org + '">' + o.org + " (limit " + o.limit + ")</option>";
+      }).join("");
+      if (chosen) sel.value = chosen;
+    }
+  }
+
+  function poll() {
+    fetch("/api/capacity", { cache: "no-store" })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        document.getElementById("dot").className = "dot on";
+        document.getElementById("pollnote").textContent = "polling every " + (POLL_MS / 1000) + "s";
+        render(d);
+      })
+      .catch(function () {
+        // The load balancer itself being unreachable is worth showing rather than
+        // silently freezing the numbers.
+        document.getElementById("dot").className = "dot off";
+        document.getElementById("pollnote").textContent = "cluster unreachable";
+      });
+  }
+
+  setInterval(poll, POLL_MS);
+  poll();
+
+  // --- load generation -------------------------------------------------------
+
+  function wsUrl(org) {
+    var proto = location.protocol === "https:" ? "wss:" : "ws:";
+    return proto + "//" + location.host + "/ws/" + org + "/?client_id=dashboard";
+  }
+
+  function updateMine() {
+    document.getElementById("g-mine").textContent = sockets.length;
+  }
+
+  var REASONS = {
+    4404: "unknown org", 4403: "org inactive", 4429: "org at its limit",
+    4503: "platform full", 4504: "node draining", 4409: "duplicate", 4500: "server error"
+  };
+
+  function openOne(org) {
+    return new Promise(function (resolve) {
+      var ws;
+      try { ws = new WebSocket(wsUrl(org)); }
+      catch (e) { log("could not open socket: " + e.message, "err"); return resolve(null); }
+
+      var settled = false;
+
+      ws.onmessage = function (ev) {
+        if (settled) return;
+        settled = true;
+        var msg = {};
+        try { msg = JSON.parse(ev.data); } catch (e) {}
+        if (msg.type === "session.established") {
+          sockets.push(ws);
+          updateMine();
+          resolve({ ok: true, node: msg.node_id });
+        } else {
+          resolve(null);
+        }
+      };
+
+      ws.onclose = function (ev) {
+        var i = sockets.indexOf(ws);
+        if (i >= 0) { sockets.splice(i, 1); updateMine(); }
+        if (!settled) {
+          settled = true;
+          resolve({ ok: false, code: ev.code });
+        } else if (ev.code === 4504) {
+          // Closed by a drain after being established: this is the reconnect signal.
+          log("session closed 4504 — node draining, reconnect elsewhere", "rej");
+        }
+      };
+
+      ws.onerror = function () { /* onclose always follows; report there */ };
+    });
+  }
+
+  document.getElementById("open").addEventListener("click", function () {
+    var btn = this;
+    var org = document.getElementById("org").value;
+    var n = parseInt(document.getElementById("count").value, 10) || 1;
+    if (!org) { log("pick an org first", "err"); return; }
+
+    btn.disabled = true;
+    log("opening " + n + " connections to " + org + "…", "dim");
+
+    var jobs = [];
+    for (var i = 0; i < n; i++) jobs.push(openOne(org));
+
+    Promise.all(jobs).then(function (results) {
+      var byNode = {}, rejected = {}, ok = 0;
+      results.forEach(function (r) {
+        if (r && r.ok) { ok++; byNode[r.node] = (byNode[r.node] || 0) + 1; }
+        else if (r) { rejected[r.code] = (rejected[r.code] || 0) + 1; }
+      });
+
+      if (ok) {
+        var spread = Object.keys(byNode).sort().map(function (k) {
+          return k + ": " + byNode[k];
+        }).join("   ");
+        log("established " + ok + "   →   " + spread, "ok");
+      }
+      Object.keys(rejected).forEach(function (code) {
+        var why = REASONS[code] || "closed";
+        log("refused " + rejected[code] + "   code " + code + "  (" + why + ")", "rej");
+      });
+      if (!ok && !Object.keys(rejected).length) log("no connections completed", "err");
+
+      btn.disabled = false;
+    });
+  });
+
+  document.getElementById("closeall").addEventListener("click", function () {
+    var n = sockets.length;
+    sockets.slice().forEach(function (ws) { ws.close(1000); });
+    sockets = [];
+    updateMine();
+    log("closed " + n + " connections", "dim");
+  });
+
+  // Browsers do close sockets on unload, but doing it explicitly means the server
+  // sees a clean close rather than a dropped transport.
+  window.addEventListener("beforeunload", function () {
+    sockets.forEach(function (ws) { ws.close(1000); });
+  });
+})();
+</script>
+</body>
+</html>
