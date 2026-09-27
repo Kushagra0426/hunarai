@@ -25,7 +25,33 @@ admission race, solved. The rest of the design follows from it.
 | Redis | Live session state, counts, node liveness | Atomic admission in one round-trip; authoritative for any quota decision |
 | Postgres | Org config, session audit trail | Durable and queryable — deliberately *not* the quota enforcer, since per-connect row locking contends exactly when load peaks |
 
-## Running it
+## Running the cluster
+
+Three nodes behind nginx, with Redis and Postgres. This is the way to see the
+system actually behave — requirements 2, 3 and 5 are multi-machine failures, and
+a single process cannot demonstrate them.
+
+```bash
+docker compose up --build -d
+curl localhost:8090/api/capacity          # three live nodes
+
+# requirement 3 — the per-org cap holds across nodes
+.venv/bin/python scripts/load.py --org initech --count 150
+
+# requirement 2 — kill a node, watch its sessions get reaped
+./scripts/chaos_kill.sh node2
+
+# requirement 5 — stop a node gracefully, watch clients move
+./scripts/chaos_drain.sh node2
+```
+
+Three nodes rather than two: with two, a killed node's sessions can only land on
+the single obvious survivor, which shows less than seeing them spread.
+
+The chaos scripts need `websockets` locally (`pip install -r requirements-dev.txt`).
+Redis is published on `16379` so you can watch live state while they run.
+
+## Running a single node
 
 Requires Redis on `localhost:6379`. Postgres is optional — without
 `DATABASE_URL` it falls back to sqlite, which is enough for a smoke test.
@@ -251,6 +277,9 @@ the annotated list. The two worth understanding:
   reserved floors live on `Organization` rows instead, since they differ per
   tenant.
 
+Full architecture, the reasoning behind each choice, and a frank list of known
+weaknesses: **[DESIGN.md](DESIGN.md)**.
+
 ## Build phases
 
 - [x] **0 — Scaffold.** Project layout, env config, health endpoint, ASGI wiring.
@@ -258,7 +287,7 @@ the annotated list. The two worth understanding:
 - [x] **2 — Atomic admission.** `admit.lua`, per-org caps, reserved floor, race test.
 - [x] **3 — Liveness and reaping.** Heartbeats, orphan cleanup on node death.
 - [x] **4 — Drain and query API.** SIGTERM wind-down, capacity endpoints.
-- [ ] **5 — Multi-node deployment.** Compose, nginx, chaos scripts, `DESIGN.md`.
+- [x] **5 — Multi-node deployment.** Compose, nginx, chaos scripts, `DESIGN.md`.
 
 A note on the app name: the app is `connsessions`, not `sessions`, because
 `django.contrib.sessions` already claims that label and Django refuses to start

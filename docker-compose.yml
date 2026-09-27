@@ -1,0 +1,129 @@
+# Three app nodes behind nginx, one Redis, one Postgres.
+#
+# Three because two cannot show the interesting case: when one node is killed,
+# you want to see its sessions land across the *remaining* nodes rather than the
+# single obvious survivor.
+
+x-node: &node
+  build: .
+  depends_on:
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+  environment: &node-env
+    REDIS_URL: redis://redis:6379/0
+    DATABASE_URL: postgres://connmgr:connmgr@postgres:5432/connmgr
+    SECRET_KEY: dev-only-not-a-real-secret
+    DEBUG: "0"
+    ALLOWED_HOSTS: "*"
+    GLOBAL_MAX_SESSIONS: "1000"
+    # Tighter than the defaults so a chaos run finishes in seconds rather than
+    # the minute a production timeout would take.
+    HEARTBEAT_SEC: "2"
+    NODE_TIMEOUT_SEC: "8"
+    REAP_INTERVAL_SEC: "2"
+    DRAIN_BATCH_SIZE: "0"
+    DRAIN_INTERVAL_MS: "0"
+    LOG_LEVEL: "INFO"
+  healthcheck:
+    # A draining node returns 503 here, so it drops out of the load balancer on
+    # its own.
+    test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health',timeout=2).status==200 else 1)\""]
+    interval: 5s
+    timeout: 3s
+    retries: 3
+    start_period: 10s
+  # Give drain time to close sessions cleanly before docker escalates to SIGKILL.
+  stop_grace_period: 30s
+  restart: unless-stopped
+
+services:
+  redis:
+    image: redis:8-alpine
+    # No persistence: this is live state that is rebuilt by nodes reconnecting,
+    # and an fsync on every admission would be a needless cost on the hot path.
+    command: redis-server --save "" --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 5
+    ports:
+      - "16379:6379"   # exposed so the chaos scripts can watch live state
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: connmgr
+      POSTGRES_PASSWORD: connmgr
+      POSTGRES_DB: connmgr
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U connmgr -d connmgr"]
+      interval: 3s
+      timeout: 2s
+      retries: 5
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  # Runs migrations and seeds orgs once, then exits. The nodes wait for it, so
+  # three of them cannot race each other applying the same migrations.
+  migrate:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *node-env
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             python manage.py seed_orgs --reset-limits"
+    restart: "no"
+
+  node1:
+    <<: *node
+    environment:
+      <<: *node-env
+      NODE_ID: node1
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  node2:
+    <<: *node
+    environment:
+      <<: *node-env
+      NODE_ID: node2
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  node3:
+    <<: *node
+    environment:
+      <<: *node-env
+      NODE_ID: node3
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  lb:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      # 8090 on the host: 8080 is a popular port and this is a demo stack.
+      - "8090:8080"
+    depends_on:
+      - node1
+      - node2
+      - node3
+
+volumes:
+  pgdata:
