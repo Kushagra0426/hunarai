@@ -21,7 +21,7 @@ admission race, solved. The rest of the design follows from it.
 
 | Layer | Holds | Why |
 | --- | --- | --- |
-| Django Channels | The sockets themselves | Consumer `connect`/`disconnect` maps onto the session lifecycle |
+| Django Channels on uvicorn | The sockets themselves | Consumer `connect`/`disconnect` maps onto the session lifecycle; uvicorn because the background loops need the ASGI lifespan |
 | Redis | Live session state, counts, node liveness | Atomic admission in one round-trip; authoritative for any quota decision |
 | Postgres | Org config, session audit trail | Durable and queryable — deliberately *not* the quota enforcer, since per-connect row locking contends exactly when load peaks |
 
@@ -37,10 +37,15 @@ cp .env.example .env
 
 .venv/bin/python manage.py migrate
 .venv/bin/python manage.py seed_orgs        # acme, globex, initech
-.venv/bin/daphne connmgr.asgi:application   # daphne, not runserver: websockets
+.venv/bin/uvicorn connmgr.asgi:application --lifespan on
 
 curl localhost:8000/health     # {"status": "ok", "node_id": "..."}
 ```
+
+uvicorn rather than daphne, and `--lifespan on` is required: the heartbeat and
+reaper loops start from the ASGI lifespan, and **daphne does not implement the
+lifespan protocol at all**, so under daphne they silently never run and dead nodes
+are never reaped.
 
 The `node_id` in that response is how the chaos scripts later confirm the load
 balancer is genuinely spreading connections across nodes.
@@ -108,6 +113,62 @@ Limits live on `Organization` rows in Postgres but are cached in
 `org:{slug}:cfg` and read from there on every connect; a `post_save` signal
 writes through, so an admin edit takes effect immediately.
 
+## Node death and orphan reaping
+
+When a node crashes nobody sends a goodbye. The sessions it held are gone but
+still counted, and an org whose quota is full of ghosts cannot connect. Fixing
+that is requirement 2.
+
+Each node writes a timestamp to `nodes:alive` every `HEARTBEAT_SEC`. A reaper on
+every node looks for entries older than `NODE_TIMEOUT_SEC` and releases those
+nodes' sessions via `reap_node.lua`.
+
+Measured, with `NODE_TIMEOUT_SEC=6`:
+
+```
+7 sessions across 2 nodes, SIGKILL one holding 4
+
+immediately after kill   org_count = 7    ghosts still counted
+4.5s later               org_count = 3    reaped
+surviving node           still serving, ping still answered
+```
+
+Three things worth knowing:
+
+- **The timeout is a tuning knob, not a correct answer.** A crashed node and a
+  briefly unreachable one are indistinguishable from outside. Too low and a
+  network blip reaps a healthy node's sessions; too high and dead nodes hold
+  quota. There is no value that is right, only one that is tuned.
+- **A node never reaps itself.** If its own heartbeat is stale it is still
+  demonstrably alive — it is running the reaper — so treating itself as dead would
+  drop working connections.
+- **The reaper runs everywhere, guarded by a lock.** No singleton service to lose;
+  whoever is up does the work. `reap_node.lua` is idempotent, so a lost race is
+  harmless, but the lock keeps duplicated work and alarming log lines down.
+
+`reap_node.lua` verifies each session hash rather than trusting the node's session
+set. On the ordinary path release already removes the id, so the check looks
+redundant — but the reaper reads `SMEMBERS` once and then works the list, so a
+release landing in between leaves it holding ids that are already accounted for.
+Counting those again drives the count below the truth, and a count that reads low
+is free capacity nobody paid for.
+
+### Repairing the audit trail
+
+A node that dies while not in `nodes:alive` at all — killed before its first
+heartbeat, or during a Redis outage — is never discovered, so its audit rows stay
+open while the live count stays correct.
+
+```bash
+.venv/bin/python manage.py reconcile --dry-run
+.venv/bin/python manage.py reconcile
+```
+
+Redis is the authority on what is live, so a row with no session in Redis is
+finished by definition. Only the audit trail is repaired; live counts are never
+touched, because guessing at them is the bug this system exists to avoid. Not on a
+timer either — a scheduled job that quietly fixes drift hides whatever causes it.
+
 ### Tests
 
 ```bash
@@ -136,7 +197,7 @@ the annotated list. The two worth understanding:
 - [x] **0 — Scaffold.** Project layout, env config, health endpoint, ASGI wiring.
 - [x] **1 — Session lifecycle.** Models, consumer, Redis register/release.
 - [x] **2 — Atomic admission.** `admit.lua`, per-org caps, reserved floor, race test.
-- [ ] **3 — Liveness and reaping.** Heartbeats, orphan cleanup on node death.
+- [x] **3 — Liveness and reaping.** Heartbeats, orphan cleanup on node death.
 - [ ] **4 — Drain and query API.** SIGTERM wind-down, capacity endpoints.
 - [ ] **5 — Multi-node deployment.** Compose, nginx, chaos scripts, `DESIGN.md`.
 

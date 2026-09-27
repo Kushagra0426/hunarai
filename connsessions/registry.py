@@ -72,7 +72,13 @@ def node_draining_key(node_id):
     return f"node:{node_id}:draining"
 
 
+def node_heartbeat_key(node_id):
+    return f"node:{node_id}:hb"
+
+
 GLOBAL_COUNT_KEY = "global:count"
+NODES_ALIVE_KEY = "nodes:alive"
+REAP_LOCK_KEY = "reaper:lock"
 
 
 # --- client and scripts ------------------------------------------------------
@@ -226,6 +232,125 @@ async def release_session(session_id, org_slug=None, node_id=None):
         sid, result[1], result[2], result[3],
     )
     return True
+
+
+# --- liveness ----------------------------------------------------------------
+# A node proves it is alive by writing a timestamp. Silence past a threshold is
+# the only signal available that a node is gone -- a crashed process sends no
+# goodbye, and a crashed node is indistinguishable from a briefly unreachable one
+# from the outside. So NODE_TIMEOUT_SEC is a tuning knob, not a correct answer:
+# too low and a network blip reaps a healthy node's sessions, too high and dead
+# nodes hold quota. See settings.py.
+#
+# The timestamp is passed in rather than read from redis.call('TIME') inside Lua,
+# which keeps the reaper testable against a fake clock.
+
+
+def _now_ms():
+    import time
+
+    return int(time.time() * 1000)
+
+
+async def heartbeat(node_id, now_ms=None):
+    """Record that this node is alive, right now.
+
+    Two writes, because they answer different questions: the sorted set is how
+    the reaper finds stale nodes in one query, while the TTL key is a cheap
+    per-node liveness check that expires on its own if the process dies.
+    """
+    now_ms = _now_ms() if now_ms is None else now_ms
+    ttl = max(settings.NODE_TIMEOUT_SEC * 2, 10)
+
+    async with get_redis().pipeline(transaction=True) as pipe:
+        pipe.zadd(NODES_ALIVE_KEY, {node_id: now_ms})
+        pipe.set(node_heartbeat_key(node_id), now_ms, ex=ttl)
+        await pipe.execute()
+
+
+async def alive_nodes():
+    """Every node with a heartbeat on record, newest last."""
+    return await get_redis().zrange(NODES_ALIVE_KEY, 0, -1)
+
+
+async def stale_nodes(timeout_sec=None, now_ms=None):
+    """Nodes whose last heartbeat is older than the timeout."""
+    timeout_sec = settings.NODE_TIMEOUT_SEC if timeout_sec is None else timeout_sec
+    now_ms = _now_ms() if now_ms is None else now_ms
+    cutoff = now_ms - (timeout_sec * 1000)
+    return await get_redis().zrangebyscore(NODES_ALIVE_KEY, "-inf", cutoff)
+
+
+async def forget_node(node_id):
+    """Remove a node's liveness records without touching its sessions.
+
+    For a node that shut down cleanly and released its own sessions. Reaping such
+    a node would be a no-op anyway, but leaving it in nodes:alive means the
+    reaper keeps rediscovering it.
+    """
+    async with get_redis().pipeline(transaction=True) as pipe:
+        pipe.zrem(NODES_ALIVE_KEY, node_id)
+        pipe.delete(node_heartbeat_key(node_id))
+        pipe.delete(node_draining_key(node_id))
+        await pipe.execute()
+
+
+# --- reaping -----------------------------------------------------------------
+
+
+async def reap_node(node_id):
+    """Release every session held by a dead node. Returns (total, {org: count}).
+
+    Safe to call on a live node's id, and safe to call twice: sessions already
+    released by their own consumer are skipped, because DEL on the session hash
+    is the gate.
+    """
+    result = await _script("reap_node")(
+        keys=[node_sessions_key(node_id), GLOBAL_COUNT_KEY, NODES_ALIVE_KEY],
+        args=[node_id],
+    )
+
+    total = int(result[0])
+    per_org = {}
+    for i in range(1, len(result), 2):
+        per_org[result[i]] = int(result[i + 1])
+
+    if total:
+        log.warning(
+            "reaped node=%s sessions=%s per_org=%s", node_id, total, per_org
+        )
+    return total, per_org
+
+
+async def acquire_reap_lock(ttl_sec=None):
+    """Try to become the one node that reaps this round.
+
+    Every node runs a reaper, so without this they would all reap the same dead
+    node at once. The script is idempotent, so a lost race is harmless rather
+    than corrupting -- but the lock keeps the work (and the log noise) to one
+    node.
+
+    The TTL is the safety valve: a node that dies holding the lock releases it by
+    expiry rather than blocking reaping forever.
+    """
+    ttl_sec = ttl_sec or max(settings.REAP_INTERVAL_SEC * 2, 10)
+    return bool(
+        await get_redis().set(
+            REAP_LOCK_KEY, settings.NODE_ID, nx=True, ex=ttl_sec
+        )
+    )
+
+
+async def release_reap_lock():
+    """Release the lock, but only if this node still holds it.
+
+    Checked rather than deleted blindly: if this node stalled long enough for the
+    lock to expire and another node to take it, deleting would hand a third node
+    the lock while the second is mid-reap.
+    """
+    r = get_redis()
+    if await r.get(REAP_LOCK_KEY) == settings.NODE_ID:
+        await r.delete(REAP_LOCK_KEY)
 
 
 # --- drain -------------------------------------------------------------------

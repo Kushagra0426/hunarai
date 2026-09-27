@@ -45,7 +45,6 @@ DEBUG = os.environ.get("DEBUG", "1") == "1"
 ALLOWED_HOSTS = os.environ.get("ALLOWED_HOSTS", "*").split(",")
 
 INSTALLED_APPS = [
-    "daphne",
     "django.contrib.admin",
     "django.contrib.auth",
     "django.contrib.contenttypes",
@@ -123,11 +122,12 @@ else:
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
 
+# In-memory, not Redis-backed. Nothing broadcasts across nodes: sessions are
+# tracked in Redis directly (see connsessions/registry.py) and drain only ever
+# closes connections on the node running it, so a cross-node layer would be a
+# Redis pub/sub subscription per process for no subscriber.
 CHANNEL_LAYERS = {
-    "default": {
-        "BACKEND": "channels_redis.core.RedisChannelLayer",
-        "CONFIG": {"hosts": [REDIS_URL]},
-    },
+    "default": {"BACKEND": "channels.layers.InMemoryChannelLayer"},
 }
 
 # --- capacity and liveness ---------------------------------------------------
