@@ -18,7 +18,7 @@ os.environ.setdefault("DJANGO_SETTINGS_MODULE", "connmgr.settings")
 # module state.
 django_asgi_app = get_asgi_application()
 
-from connsessions import registry, tasks  # noqa: E402
+from connsessions import drain, registry, tasks  # noqa: E402
 from connsessions.routing import websocket_urlpatterns  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -85,9 +85,65 @@ class Lifespan:
             ),
             asyncio.create_task(tasks.reaper_loop(self.stop_event), name="reaper"),
         ]
+        self._install_sigterm_handler()
         log.info("node=%s startup complete", settings.NODE_ID)
 
+    def _install_sigterm_handler(self):
+        """Drain on SIGTERM, before the server closes anything itself.
+
+        Lifespan shutdown is too late: uvicorn handles SIGTERM by closing live
+        websockets with 1012 (Service Restart) and only then runs the shutdown
+        event, so by the time drain() was reached there was nothing left to close
+        and clients could not tell a drain from any other restart.
+
+        Chaining to uvicorn's own handler rather than replacing it keeps the
+        normal shutdown sequence intact -- this only interposes the drain.
+        """
+        import signal
+
+        loop = asyncio.get_running_loop()
+        previous = signal.getsignal(signal.SIGTERM)
+
+        def on_sigterm(signum, frame):
+            # Signal context: schedule the drain rather than running it here.
+            loop.create_task(self._drain_then(previous, signum, frame))
+
+        try:
+            signal.signal(signal.SIGTERM, on_sigterm)
+        except ValueError:
+            # Not the main thread (some test runners). The lifespan shutdown
+            # drain still covers the ordinary path.
+            log.debug("could not install SIGTERM handler off the main thread")
+
+    async def _drain_then(self, previous_handler, signum, frame):
+        """Close sessions cleanly, then let the server shut down as usual."""
+        from django.conf import settings
+
+        try:
+            closed = await drain.drain(node_id=settings.NODE_ID)
+            log.info("sigterm drain closed %s sessions", closed)
+        except Exception:
+            log.exception("sigterm drain failed")
+
+        if callable(previous_handler):
+            previous_handler(signum, frame)
+
     async def shutdown(self):
+        from django.conf import settings
+
+        node_id = settings.NODE_ID
+
+        # Drain before stopping the heartbeat. The reaper on another node must
+        # keep seeing this one as alive while it winds down, or it would start
+        # reaping sessions that are being closed cleanly right here and the audit
+        # trail would call them node_lost.
+        try:
+            closed = await drain.drain(node_id=node_id)
+            if closed:
+                log.info("drained %s sessions node=%s", closed, node_id)
+        except Exception:
+            log.exception("drain failed node=%s", node_id)
+
         if self.stop_event is not None:
             self.stop_event.set()
 
@@ -99,8 +155,16 @@ class Lifespan:
                 task.cancel()
             self.background = []
 
+        # Sessions are released and the node is going away, so drop its liveness
+        # records. Without this the reaper keeps finding a node that left cleanly
+        # and logs it as a corpse.
+        try:
+            await registry.forget_node(node_id)
+        except Exception:
+            log.exception("could not clear liveness records node=%s", node_id)
+
         await registry.close_redis()
-        log.info("shutdown complete")
+        log.info("shutdown complete node=%s", node_id)
 
 
 application = Lifespan(inner_application)

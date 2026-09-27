@@ -4,6 +4,7 @@ __pycache__/
 
 .env
 db.sqlite3
+test-db.sqlite3
 staticfiles/
 
 .pytest_cache/

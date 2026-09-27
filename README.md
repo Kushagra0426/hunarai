@@ -69,7 +69,7 @@ Rejections arrive as application close codes, split by whether retrying helps:
 | `4403` | Org inactive | No |
 | `4429` | Org at its own ceiling | No — buy more capacity |
 | `4503` | Platform full, org above its floor | Yes, later |
-| `4504` | Node draining | Yes, immediately — another node will take it |
+| `4504` | Node draining or shutting down | Yes, immediately — another node will take it |
 | `4409` | Duplicate session id | No |
 
 Watch the live state while a client is connected:
@@ -153,6 +153,65 @@ release landing in between leaves it holding ids that are already accounted for.
 Counting those again drives the count below the truth, and a count that reads low
 is free capacity nobody paid for.
 
+## Graceful drain
+
+On SIGTERM a node sets its drain flag in Redis, then closes its live connections
+with **4504**, and the load balancer sends the retries to a healthy node.
+
+Order matters and is the whole correctness argument: the flag goes in *first*, so
+`admit.lua` is already refusing new sessions for this node before any socket is
+closed. The other order leaves a window where a connection lands on a node that
+is shutting down.
+
+Measured — SIGTERM a node holding 6 of 6 sessions:
+
+```
+all closed in 0.66s with code 4504
+org_count       6 -> 0
+nodes:alive     drain-n1 removed
+6 reconnects    all landed on drain-n2
+audit trail     6 rows marked "drained", not "client"
+```
+
+**Sessions are not migrated.** The connection genuinely breaks and the client
+genuinely reconnects. Moving a live session would mean serialising its state and
+handing it to another node — a substantially harder problem, and out of scope
+here. Better said plainly than implied away.
+
+Drain is installed as a SIGTERM handler rather than run from lifespan shutdown,
+which is too late: uvicorn handles SIGTERM by closing live websockets with `1012`
+(Service Restart) and only *then* fires the shutdown event, so a drain there
+finds nothing left to close and clients cannot tell a planned drain from a crash.
+
+Pacing is off by default — `DRAIN_BATCH_SIZE=0` closes everything at once. Set a
+batch size and `DRAIN_INTERVAL_MS` to spread the reconnects; the surviving nodes
+are already absorbing this node's load, so handing them every reconnect in the
+same instant is the worst moment to do it.
+
+## Query API
+
+Requirement 6: any node answers, because the answers come from Redis rather than
+from the node's own view of its connections.
+
+```bash
+curl localhost:8000/api/capacity
+curl localhost:8000/api/orgs/acme/sessions
+curl localhost:8000/api/sessions/<session-id>
+```
+
+Every response carries `answered_by`, so you can see that a session on `node-1`
+is reported identically by `node-2`. `/api/orgs/<slug>/sessions` includes a
+`by_node` breakdown — that is what shows the balancer spreading an org across
+nodes, and what shows a node's sessions vanishing when it dies.
+
+The views are **async**. They share the process's Redis client with the
+consumers, so a sync view bridging via `asyncio.run()` creates a second event
+loop inside the running server and fails with "Future attached to a different
+loop" the moment it touches that client.
+
+`/health` returns **503 while draining**, so the load balancer stops sending new
+connections to a node that is on its way out.
+
 ### Repairing the audit trail
 
 A node that dies while not in `nodes:alive` at all — killed before its first
@@ -198,7 +257,7 @@ the annotated list. The two worth understanding:
 - [x] **1 — Session lifecycle.** Models, consumer, Redis register/release.
 - [x] **2 — Atomic admission.** `admit.lua`, per-org caps, reserved floor, race test.
 - [x] **3 — Liveness and reaping.** Heartbeats, orphan cleanup on node death.
-- [ ] **4 — Drain and query API.** SIGTERM wind-down, capacity endpoints.
+- [x] **4 — Drain and query API.** SIGTERM wind-down, capacity endpoints.
 - [ ] **5 — Multi-node deployment.** Compose, nginx, chaos scripts, `DESIGN.md`.
 
 A note on the app name: the app is `connsessions`, not `sessions`, because

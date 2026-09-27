@@ -19,7 +19,7 @@ from channels.generic.websocket import AsyncJsonWebsocketConsumer
 from django.conf import settings
 from django.utils import timezone
 
-from . import registry
+from . import drain, registry
 from .models import Organization, SessionRecord
 
 log = logging.getLogger(__name__)
@@ -133,6 +133,10 @@ class SessionConsumer(AsyncJsonWebsocketConsumer):
             await self.close(code=CLOSE_INTERNAL)
             return
 
+        # Drain closes connections by walking this set, so a session must be in
+        # it before the client is told it is established.
+        drain.register_consumer(self)
+
         await self.accept()
         await self.send_json(
             {
@@ -147,14 +151,25 @@ class SessionConsumer(AsyncJsonWebsocketConsumer):
 
     async def disconnect(self, code):
         """Release the slot. Called for clean and abnormal closes alike."""
+        drain.unregister_consumer(self)
+
         if not getattr(self, "registered", False):
             return
+
+        # A node draining closed this, so record why rather than blaming the
+        # client -- the distinction is the difference between "users hung up" and
+        # "we shut the node down" when reading history after a deploy.
+        reason = (
+            SessionRecord.EndReason.DRAINED
+            if code == drain.CLOSE_RECONNECT_ELSEWHERE or drain.is_draining()
+            else SessionRecord.EndReason.CLIENT
+        )
 
         try:
             await registry.release_session(
                 self.session_id, self.org_slug, self.node_id
             )
-            await self._close_record(SessionRecord.EndReason.CLIENT)
+            await self._close_record(reason)
         except Exception:
             # Never raise out of disconnect: the socket is already gone, and an
             # exception here buys nothing but a noisy traceback. The phase 3
