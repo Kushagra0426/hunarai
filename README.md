@@ -36,13 +36,40 @@ python3 -m venv .venv
 cp .env.example .env
 
 .venv/bin/python manage.py migrate
-.venv/bin/python manage.py runserver
+.venv/bin/python manage.py seed_orgs        # acme, globex, initech
+.venv/bin/daphne connmgr.asgi:application   # daphne, not runserver: websockets
 
 curl localhost:8000/health     # {"status": "ok", "node_id": "..."}
 ```
 
 The `node_id` in that response is how the chaos scripts later confirm the load
 balancer is genuinely spreading connections across nodes.
+
+### Connecting a session
+
+```
+ws://localhost:8000/ws/<org_slug>/?client_id=<opaque-id>
+```
+
+The server replies with `session.established` carrying the session id and the
+node that took the connection. `{"type": "ping"}` gets a `pong`, which is how the
+chaos scripts confirm a held connection is genuinely alive rather than merely
+unclosed. Rejections arrive as application close codes — `4404` unknown org,
+`4403` org inactive — so a client can tell "not allowed" from "server down".
+
+Watch the live state while a client is connected:
+
+```bash
+redis-cli get org:acme:count
+redis-cli smembers org:acme:sessions
+redis-cli hgetall session:<session-id>
+```
+
+### Tests
+
+```bash
+.venv/bin/pytest          # needs a local Redis; uses db 15, ignores DATABASE_URL
+```
 
 ## Configuration
 
@@ -59,7 +86,8 @@ the annotated list. The two worth understanding:
 ## Build phases
 
 - [x] **0 — Scaffold.** Project layout, env config, health endpoint, ASGI wiring.
-- [ ] **1 — Session lifecycle.** Models, consumer, Redis register/release.
+- [x] **1 — Session lifecycle.** Models, consumer, Redis register/release. No
+      limits yet: a connection is admitted if the org exists and is active.
 - [ ] **2 — Atomic admission.** `admit.lua`, per-org caps, reserved floor, race test.
 - [ ] **3 — Liveness and reaping.** Heartbeats, orphan cleanup on node death.
 - [ ] **4 — Drain and query API.** SIGTERM wind-down, capacity endpoints.

@@ -1,3 +1,9 @@
-# Consumers land in phase 1. Keeping the list empty (but real) means the ASGI
-# app is wired end to end and the websocket protocol is reachable now.
-websocket_urlpatterns = []
+from django.urls import path
+
+from .consumers import SessionConsumer
+
+# The org is in the path, not a header: it is the tenant the slot is billed to,
+# and having it in the URL keeps the load balancer able to see it too.
+websocket_urlpatterns = [
+    path("ws/<slug:org_slug>/", SessionConsumer.as_asgi()),
+]
